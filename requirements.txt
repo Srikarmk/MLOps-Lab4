@@ -1,0 +1,3 @@
+# Packages the DAGs need on top of the apache/airflow:3.3.2-python3.12 image.
+# The image already ships pandas 3.0.5, numpy 2.5.3, scikit-learn 1.9.1 and scipy 1.18.1.
+kneed==0.8.5

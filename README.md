@@ -1,3 +1,11 @@
+> **Running this version.** The tutorial below targets Airflow 2.5.1, but the DAG uses Airflow 3 imports, and no `docker-compose.yaml` ships with it. This repo pins **Airflow 3.3.2** in `docker-compose.yaml` (LocalExecutor + Postgres) and builds an image with the DAG's packages (`Dockerfile`, `requirements.txt`). You only need [Docker Desktop](https://docs.docker.com/get-docker/), with at least 4 GB of memory for its VM.
+>
+> ```sh
+> ./setup.sh                 # build the image, migrate the database, start Airflow
+> ```
+>
+> Open http://localhost:8080 (no login), unpause **Airflow_Lab1** and trigger it. The trained model appears in `dags/model/`. Stop with `docker compose down` (`-v` also deletes the metadata database). If port 8080 is taken: `AIRFLOW_PORT=8081 ./setup.sh`.
+
 # Airflow lab
 
 - In order to install Airflow using docker you can watch our [Airflow Lab1 Tutorial Video](https://youtu.be/exFSeGUbn4Q?feature=shared)
