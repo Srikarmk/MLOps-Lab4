@@ -17,17 +17,41 @@ from sklearn.preprocessing import MinMaxScaler
 from threadpoolctl import threadpool_limits
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+ID_COLUMN = "CUST_ID"
 FEATURES = ["BALANCE", "PURCHASES", "CREDIT_LIMIT"]
-K_VALUES = list(range(1, 50))
 KMEANS_KWARGS = {"init": "random", "n_init": 10, "max_iter": 300, "random_state": 42}
 
 
-def load_data(run_dir) -> str:
-    """Copy the raw CSV into the run's folder as Parquet. Returns its path."""
-    df = pd.read_csv(DATA_DIR / "file.csv")
+def load_data(input_file, run_dir) -> str:
+    """Copy a CSV from the data folder into the run's folder as Parquet. Returns its path."""
+    df = pd.read_csv(DATA_DIR / input_file)
     out_path = Path(run_dir) / "raw.parquet"
     df.to_parquet(out_path, index=False)
     return str(out_path)
+
+
+def validate_data(raw_path, run_dir, min_rows, max_missing_fraction) -> dict:
+    """Run the data-quality checks and save them to quality_report.json. Returns the report."""
+    df = pd.read_parquet(raw_path)
+    missing_columns = [c for c in [ID_COLUMN, *FEATURES] if c not in df.columns]
+    checks = {"required_columns": {"passed": not missing_columns, "missing": missing_columns}}
+
+    if not missing_columns:
+        incomplete = float(df.isna().any(axis=1).mean())
+        negative = {c: int((df[c] < 0).sum()) for c in FEATURES}
+        duplicates = int(df[ID_COLUMN].duplicated().sum())
+        checks.update({
+            "row_count": {"passed": len(df) >= min_rows, "rows": len(df), "min_rows": min_rows},
+            "missing_values": {"passed": incomplete <= max_missing_fraction,
+                               "fraction_of_rows": round(incomplete, 4), "max": max_missing_fraction},
+            "non_negative": {"passed": not any(negative.values()), "negative_values": negative},
+            "unique_ids": {"passed": duplicates == 0, "duplicates": duplicates},
+        })
+
+    report = {"passed": all(c["passed"] for c in checks.values()), "checks": checks}
+    with open(Path(run_dir) / "quality_report.json", "w") as f:
+        json.dump(report, f, indent=2)
+    return report
 
 
 def data_preprocessing(raw_path, run_dir) -> dict:
@@ -79,6 +103,12 @@ def train_final_model(scaled_path, scaler_path, k, run_dir) -> str:
     return str(model_path)
 
 
+def out_of_range_features(scaler, row) -> list:
+    """Features of a row that fall outside the range seen in training, where the clusters say little."""
+    scaled = scaler.transform(row[FEATURES])[0]
+    return [f for f, v in zip(FEATURES, scaled) if v < 0 or v > 1]
+
+
 def predict(model_path, raw_path, run_dir) -> dict:
     """Assign every customer to a cluster, and predict the cluster of the row in test.csv."""
     with open(model_path, "rb") as f:
@@ -86,15 +116,19 @@ def predict(model_path, raw_path, run_dir) -> dict:
 
     customers = pd.read_parquet(raw_path).dropna()
     customers["cluster"] = model.predict(customers[FEATURES])
-    customers[["CUST_ID", *FEATURES, "cluster"]].to_csv(Path(run_dir) / "clusters.csv", index=False)
+    customers[[ID_COLUMN, *FEATURES, "cluster"]].to_csv(Path(run_dir) / "clusters.csv", index=False)
 
     test = pd.read_csv(DATA_DIR / "test.csv")
     test_cluster = int(model.predict(test[FEATURES])[0])
+    out_of_range = out_of_range_features(model.named_steps["scaler"], test)
     print(f"test.csv row {test.iloc[0].to_dict()} -> cluster {test_cluster}")
+    if out_of_range:
+        print(f"WARNING: {out_of_range} outside the training range, so this cluster is unreliable")
 
     sizes = customers["cluster"].value_counts().sort_index()
     return {
         "k": int(model.named_steps["kmeans"].n_clusters),
         "test_cluster": test_cluster,
+        "test_out_of_range": out_of_range,
         "cluster_sizes": {str(c): int(n) for c, n in sizes.items()},
     }

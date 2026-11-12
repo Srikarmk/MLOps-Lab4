@@ -4,7 +4,7 @@
 > ./setup.sh                 # build the image, migrate the database, start Airflow
 > ```
 >
-> Open http://localhost:8080 (no login), unpause **Airflow_Lab1** and trigger it. Each run writes its data and model to `working_data/<run id>/`. Stop with `docker compose down` (`-v` also deletes the metadata database). If port 8080 is taken: `AIRFLOW_PORT=8081 ./setup.sh`.
+> Open http://localhost:8080 (no login), unpause **Airflow_Lab1** and trigger it. Each run writes its data and model to `working_data/<run id>/`. To see the data-quality gate reject a file, choose "Trigger with config" and set `input_file` to `bad_sample.csv`; the other Params (k range, gate thresholds) are on the same form. Stop with `docker compose down` (`-v` also deletes the metadata database). If port 8080 is taken: `AIRFLOW_PORT=8081 ./setup.sh`.
 
 # Airflow lab
 
