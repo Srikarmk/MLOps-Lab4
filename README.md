@@ -1,346 +1,289 @@
-> **Running this version.** The tutorial below targets Airflow 2.5.1, but the DAG uses Airflow 3 imports, and no `docker-compose.yaml` ships with it. This repo pins **Airflow 3.3.2** in `docker-compose.yaml` (LocalExecutor + Postgres) and builds an image with the DAG's packages (`Dockerfile`, `requirements.txt`). You only need [Docker Desktop](https://docs.docker.com/get-docker/), with at least 4 GB of memory for its VM.
->
-> ```sh
-> ./setup.sh                 # build the image, migrate the database, start Airflow
-> ```
->
-> Open http://localhost:8080 (no login) and unpause both DAGs. **customer_data_ingest** (daily) loads and checks `dags/data/file.csv` and, only if the data passes its quality gate, publishes it as the `customers` Asset. **customer_clustering** has no clock schedule: each published version starts it automatically. Every run writes its files to `working_data/<run id>/`, and published data goes to `working_data/datasets/customers/`. To see the gate reject a file, trigger customer_data_ingest with config `input_file` = `bad_sample.csv`; no clustering run follows. Stop with `docker compose down` (`-v` also deletes the metadata database). If port 8080 is taken: `AIRFLOW_PORT=8081 ./setup.sh`.
+# Airflow Lab: Customer Segmentation Pipeline
 
-# Airflow lab
+This lab segments 8,950 credit-card customers with KMeans, orchestrated by **Apache Airflow 3.3.2**. It covers:
+- two DAGs connected by an **Asset**: a daily ingest DAG that publishes data only after it passes a **data-quality gate**, and a clustering DAG that runs whenever new data is published
+- **dynamic task mapping** to fit one KMeans model per number of clusters in parallel
+- the **TaskFlow API**, **Params**, **branching**, **retries**, **timeouts** and a **failure callback**
+- **tests** for the DAGs and the pipeline code
 
-- In order to install Airflow using docker you can watch our [Airflow Lab1 Tutorial Video](https://youtu.be/exFSeGUbn4Q?feature=shared)
-- For latest step-by-step instructions, check out this blog - [AirFlow Lab-1](https://www.mlwithramin.com/blog/airflow-lab1)
+It is based on the course's Airflow Lab 1 (`Labs/Airflow_Labs/Lab_1`), a single 4-task DAG. The original write-up is kept unchanged in [ORIGINAL_LAB.md](ORIGINAL_LAB.md). That version doesn't run as shipped, and its model has two bugs; [What changed](#what-changed-from-the-original-lab) lists every change and why.
 
-### ML Model
+## Contents
 
-This script is designed for data clustering using K-Means clustering and determining the optimal number of clusters using the elbow method. It provides functionality to load data from a CSV file, perform data preprocessing, build and save a K-Means clustering model, and determine the number of clusters based on the elbow method.
+- [Prerequisites](#prerequisites)
+- [Setup](#setup)
+- [Run the whole lab in one command](#run-the-whole-lab-in-one-command)
+- [Run it yourself in the Airflow UI](#run-it-yourself-in-the-airflow-ui)
+- [How the pipeline works](#how-the-pipeline-works)
+- [What a successful run looks like](#what-a-successful-run-looks-like)
+- [Results and findings](#results-and-findings)
+- [What changed from the original lab](#what-changed-from-the-original-lab)
+- [Project layout](#project-layout)
+- [Troubleshooting](#troubleshooting)
 
-#### Prerequisites
+## Prerequisites
 
-Before using this script, make sure you have the following libraries installed:
+You only need **Docker** and **Git**, plus a bash shell to run the two scripts. Airflow, Python and every Python package run inside the containers, so nothing else is installed on your machine.
 
-- pandas
-- scikit-learn (sklearn)
-- kneed
-- pickle
+| Requirement | Version tested | Install |
+|---|---|---|
+| Docker Desktop (Docker Engine + Compose v2) | Engine 29.8.2, Compose 5.5.1 | [docs.docker.com/get-docker](https://docs.docker.com/get-docker/). On Linux, Docker Engine plus the `docker compose` plugin is enough |
+| Git | any | macOS: `xcode-select --install`; Ubuntu: `sudo apt install git`; Windows: `winget install Git.Git` |
+| bash | any | built into macOS and Linux. On Windows, use **WSL 2** (recommended) or Git Bash |
 
-#### Usage
+**Docker resources.** Give Docker's VM at least **4 GB of memory**: Docker Desktop → Settings → Resources. The lab peaks at about 2.7 GB, and Airflow recommends 8 GB. You'll also need about **5 GB of free disk**: the built Airflow image is 3.3 GB and Postgres is 0.7 GB.
 
-You can use this script to perform K-Means clustering on your dataset as follows:
+Check Docker is running:
 
-```python
-# Load the data
-data = load_data()
-
-# Preprocess the data
-preprocessed_data = data_preprocessing(data)
-
-# Build and save the clustering model
-sse_values = build_save_model(preprocessed_data, 'clustering_model.pkl')
-
-# Load the saved model and determine the number of clusters
-result = load_model_elbow('clustering_model.pkl', sse_values)
-print(result)
+```bash
+docker version --format 'Engine {{.Server.Version}}' && docker compose version --short
 ```
 
-#### Functions
+This should print an engine version and a Compose version (2.x or later). If it says it can't connect to the Docker daemon, start Docker Desktop.
 
-1. **load_data():**
-   - *Description:* Loads data from a CSV file, serializes it, and returns the serialized data.
-   - *Usage:*
-     ```python
-     data = load_data()
-     ```
+**What runs inside the image.** The `Dockerfile` builds on `apache/airflow:3.3.2-python3.12` and adds the packages in `requirements.txt`:
 
-2. **data_preprocessing(data)**
-   - *Description:* Deserializes data, performs data preprocessing, and returns serialized clustered data.
-   - *Usage:*
-     ```python
-     preprocessed_data = data_preprocessing(data)
-     ```
+| Package | Version | Source | Used for |
+|---|---|---|---|
+| apache-airflow | 3.3.2 | base image (pinned again in the `Dockerfile`) | scheduler, API server, DAG processor |
+| Python | 3.12.14 | base image | |
+| pandas / numpy / scikit-learn / scipy | 3.0.5 / 2.5.3 / 1.9.1 / 1.18.1 | base image | data handling, MinMaxScaler, KMeans |
+| kneed | 0.8.5 | `requirements.txt` | finding the elbow of the SSE curve |
+| pytest | 9.1.1 | `requirements.txt` | the tests in `tests/` |
+| Postgres | 16 | `postgres:16` image | Airflow's metadata database |
 
-3. **build_save_model(data, filename)**
-   - *Description:* Builds a K-Means clustering model, saves it to a file, and returns SSE values.
-   - *Usage:*
-     ```python
-     sse_values = build_save_model(preprocessed_data, 'clustering_model.pkl')
-     ```
+## Setup
 
-4. **load_model_elbow(filename, sse)**
-   - *Description:* Loads a saved K-Means clustering model and determines the number of clusters using the elbow method.
-   - *Usage:*
-     ```python
-     result = load_model_elbow('clustering_model.pkl', sse_values)
-     ```
-### Airflow Setup
-
-Use Airflow to author workflows as directed acyclic graphs (DAGs) of tasks. The Airflow scheduler executes your tasks on an array of workers while following the specified dependencies.
-
-References
-
--   Product - https://airflow.apache.org/
--   Documentation - https://airflow.apache.org/docs/
--   Github - https://github.com/apache/airflow
-
-#### Installation
-
-Prerequisites: You should allocate at least 4GB memory for the Docker Engine (ideally 8GB).
-
-Local
-
--   Docker Desktop Running
-
-Cloud
-
--   Linux VM
--   SSH Connection
--   Installed Docker Engine - [Install using the convenience script](https://docs.docker.com/engine/install/ubuntu/#install-using-the-convenience-script)
-
-#### Tutorial
-
-1. Create a new directory
-
-    ```bash
-    mkdir -p ~/app
-    cd ~/app
-    ```
-
-2. Running Airflow in Docker - [Refer](https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#running-airflow-in-docker)
-
-    a. You can check if you have enough memory by running this command
-
-    ```bash
-    docker run --rm "debian:bullseye-slim" bash -c 'numfmt --to iec $(echo $(($(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE))))'
-    ```
-
-    b. Fetch [docker-compose.yaml](https://airflow.apache.org/docs/apache-airflow/2.5.1/docker-compose.yaml)
-
-    ```bash
-    curl -LfO 'https://airflow.apache.org/docs/apache-airflow/2.5.1/docker-compose.yaml'
-    ```
-
-    c. Setting the right Airflow user
-
-    ```bash
-    mkdir -p ./dags ./logs ./plugins ./working_data
-    echo -e "AIRFLOW_UID=$(id -u)" > .env
-    ```
-
-    d. Update the following in docker-compose.yml
-
-    ```bash
-    # Donot load examples
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-
-    # Additional python package
-    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:- pandas }
-
-    # Output dir
-    - ${AIRFLOW_PROJ_DIR:-.}/working_data:/opt/airflow/working_data
-
-    # Change default admin credentials
-    _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow2}
-    _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow2}
-    ```
-
-    e. Initialize the database
-
-    ```bash
-    docker compose up airflow-init
-    ```
-
-    f. Running Airflow
-
-    ```bash
-    docker compose up
-    ```
-
-    Wait until terminal outputs
-
-    `app-airflow-webserver-1  | 127.0.0.1 - - [17/Feb/2023:09:34:29 +0000] "GET /health HTTP/1.1" 200 141 "-" "curl/7.74.0"`
-
-    g. Enable port forwarding
-
-    h. Visit `localhost:8080` login with credentials set on step `2.d`
-
-3. Explore UI and add user `Security > List Users`
-
-4. Create a python script [`dags/sandbox.py`](dags/sandbox.py)
-
-    - BashOperator
-    - PythonOperator
-    - Task Dependencies
-    - Params
-    - Crontab schedules
-
-    You can have n number of scripts inside dags dir
-
-5. Stop docker containers
-
-    ```bash
-    docker compose down
-    ```
-### Airflow DAG Script
-
-This Markdown file provides a detailed explanation of the Python script that defines an Airflow Directed Acyclic Graph (DAG) for a data processing and modeling workflow.
-
-#### Script Overview
-
-The script defines an Airflow DAG named `your_python_dag` that consists of several tasks. Each task represents a specific operation in a data processing and modeling workflow. The script imports necessary libraries, sets default arguments for the DAG, creates PythonOperators for each task, defines task dependencies, and provides command-line interaction with the DAG.
-
-#### Importing Libraries
-
-```python
-# Import necessary libraries and modules
-from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
-from datetime import datetime, timedelta
-from src.lab import load_data, data_preprocessing, build_save_model, load_model_elbow
-from airflow import configuration as conf
-```
-The script starts by importing the required libraries and modules. Notable imports include the `DAG` and `PythonOperator` classes from the `airflow` package, datetime manipulation functions, and custom functions from the `src.lab` module.
-
-
-
-#### Enable pickle support for XCom, allowing data to be passed between tasks
-```python
-conf.set('core', 'enable_xcom_pickling', 'True')
+```bash
+git clone https://github.com/Srikarmk/MLOps-Lab4.git
+cd MLOps-Lab4
+./setup.sh
 ```
 
-#### Define default arguments for your DAG
-```python
-default_args = {
-    'owner': 'your_name',
-    'start_date': datetime(2023, 9, 17),
-    'retries': 0,  # Number of retries in case of task failure
-    'retry_delay': timedelta(minutes=5),  # Delay before retries
-}
-```
-Default arguments for the DAG are specified in a dictionary named default_args. These arguments include the DAG owner's name, the start date, the number of retries, and the retry delay in case of task failure.
+`setup.sh` does six things:
+1. It checks that Docker is installed and running.
+2. It removes any containers and metadata database left by a previous run.
+3. It writes `.env` with your user ID, so files Airflow writes into `working_data/` and `logs/` belong to you.
+4. It builds the image.
+5. It migrates the database.
+6. It starts Postgres, the API server, the scheduler and the DAG processor, then waits until all of them report healthy.
 
-#### Create a DAG instance named 'your_python_dag' with the defined default arguments
-``` python 
-dag = DAG(
-    'your_python_dag',
-    default_args=default_args,
-    description='Your Python DAG Description',
-    schedule_interval=None,  # Set the schedule interval or use None for manual triggering
-    catchup=False,
-)
-```
-Here, the DAG object dag is created with the name 'your_python_dag' and the specified default arguments. The description provides a brief description of the DAG, and schedule_interval defines the execution schedule (in this case, it's set to None for manual triggering). catchup is set to False to prevent backfilling of missed runs.
+The first run downloads about 1.3 GB of images and takes a few minutes; later runs take about 35 seconds. It ends with:
 
-
-#### Task to load data, calls the 'load_data' Python function
-``` python 
-load_data_task = PythonOperator(
-    task_id='load_data_task',
-    python_callable=load_data,
-    dag=dag,
-)
+```text
+Airflow is running at http://localhost:8080 (no login needed)
 ```
 
-#### Task to perform data preprocessing, depends on 'load_data_task'
-```python 
-data_preprocessing_task = PythonOperator(
-    task_id='data_preprocessing_task',
-    python_callable=data_preprocessing,
-    op_args=[load_data_task.output],
-    dag=dag,
-)
+Open http://localhost:8080. You should see the two DAGs, **customer_data_ingest** and **customer_clustering**, both paused, with no import errors. If port 8080 is already in use, run `AIRFLOW_PORT=8081 ./setup.sh` and use that port instead.
+
+> **No login, local only.** The UI and API are bound to `127.0.0.1` and every visitor is an admin (Airflow's `SimpleAuthManager` with `all_admins`). That suits a lab on your own machine; don't expose this setup to a network.
+
+## Run the whole lab in one command
+
+```bash
+./run_lab.sh
 ```
-The 'data_preprocessing_task' depends on the 'load_data_task' and calls the data_preprocessing function, which is provided with the output of the 'load_data_task'.
 
-#### Task to build and save a model, depends on 'data_preprocessing_task'
-```python
-build_save_model_task = PythonOperator(
-    task_id='build_save_model_task',
-    python_callable=build_save_model,
-    op_args=[data_preprocessing_task.output, "model.sav"],
-    provide_context=True,
-    dag=dag,
-)
+`run_lab.sh` runs three stages and stops at the first failure:
+1. **Fresh start:** runs `./setup.sh`.
+2. **Tests:** runs the 18 pytest tests inside the Airflow image.
+3. **End-to-end check:** runs `tests/end_to_end.py` against the live scheduler, which:
+   - unpauses both DAGs
+   - confirms the daily ingest run passes the quality gate and publishes the data
+   - confirms that publish starts a clustering run **by itself**, on exactly the version that was published
+   - checks the clustering run fits all 49 models and trains with the elbow's k
+   - triggers an ingest of `bad_sample.csv` and confirms it is rejected and starts **no** clustering run
+
+A full run takes about 3 minutes once the images are downloaded. Airflow is left running so you can look at the runs in the UI. `./run_lab.sh --down` stops it and deletes the database at the end instead. `AIRFLOW_PORT=8081 ./run_lab.sh` uses another port.
+
+## Run it yourself in the Airflow UI
+
+With Airflow running (from `./setup.sh`):
+
+1. **Unpause `customer_clustering`**, then **unpause `customer_data_ingest`**, using the toggles on the DAGs page. The ingest DAG is scheduled `@daily` with `catchup=False`, so unpausing it starts the latest daily run straight away.
+2. Watch **customer_data_ingest**. Its Graph view shows `load_data → validate_data → quality_gate`, then `publish_dataset` running and `reject_data` skipped.
+3. A run of **customer_clustering** appears by itself, with run type *asset_triggered*. Its graph shows `fit_kmeans [49]`; click it to see the 49 mapped task instances, 8 running at a time.
+4. **Browse → Assets** shows `customers` (produced by ingest, consumed by clustering) and `customer_segments`, with an event per publish and its metadata.
+5. **Reject bad data:** on customer_data_ingest choose **Trigger** and set `input_file` to `bad_sample.csv` in the form.
+   - The run fails at `reject_data`, `publish_dataset` is skipped, and no clustering run follows.
+   - `working_data/<run id>/quality_report.json` says which checks failed.
+6. **Change the search:** trigger customer_clustering with `k_max` = `30`. It creates 30 mapped tasks instead of 49 and re-clusters the newest published version.
+
+The same from the command line:
+
+```bash
+docker compose run --rm airflow-cli airflow dags unpause customer_clustering
+docker compose run --rm airflow-cli airflow dags unpause customer_data_ingest
+docker compose run --rm airflow-cli airflow dags trigger customer_data_ingest --conf '{"input_file": "bad_sample.csv"}'
+docker compose run --rm airflow-cli airflow dags list-runs customer_clustering
 ```
-The 'build_save_model_task' depends on the 'data_preprocessing_task' and calls the build_save_model function. It also provides additional context information and arguments.
 
-#### Task to load a model using the 'load_model_elbow' function, depends on 'build_save_model_task'
-``` python
-load_model_task = PythonOperator(
-    task_id='load_model_task',
-    python_callable=load_model_elbow,
-    op_args=["model.sav", build_save_model_task.output],
-    dag=dag,
-)
+Run the tests on their own:
+
+```bash
+docker compose run --rm --no-deps airflow-cli bash -c "cd /opt/airflow && python -m pytest tests -v"
 ```
-The 'load_model_task' depends on the 'build_save_model_task' and calls the load_model_elbow function with specific arguments.
 
-#### Set task dependencies
-```python
-load_data_task >> data_preprocessing_task >> build_save_model_task >> load_model_task
+Debug one DAG in a single process, with no scheduler: `docker compose exec airflow-scheduler python /opt/airflow/dags/kmeans_pipeline.py`. That calls `dag.test()`.
+
+**Stopping:** `docker compose down` keeps the metadata database, and `docker compose up -d --wait` brings it back. `docker compose down -v` deletes it. Files in `working_data/` stay either way; delete the folder to clear them.
+
+## How the pipeline works
+
+```text
+customer_data_ingest  (@daily, or triggered)
+  load_data ──> validate_data ──> quality_gate ─┬─> publish_dataset ──> [Asset: customers]
+                                                └─> reject_data   (fails the run; nothing is published)
+
+[Asset: customers] ──> customer_clustering  (no clock schedule: runs on each published version)
+  k_values ──> resolve_dataset ──> data_preprocessing ──> fit_kmeans ×N ──> choose_k ──> train_final_model ──> predict ──> [Asset: customer_segments]
+                                                           (mapped, 8 at once)  (elbow)    (scaler + KMeans)
 ```
-Task dependencies are defined using the >> operator. In this case, the tasks are executed in sequence: 'load_data_task' -> 'data_preprocessing_task' -> 'build_save_model_task' -> 'load_model_task'.
 
-#### If this script is run directly, allow command-line interaction with the DAG
-```python
-if __name__ == "__main__":
-    dag.cli()
+**Data-quality gate** (`validate_data`, then `@task.branch quality_gate`). All five checks must pass for the data to be published:
+
+| Check | Rule | The real data |
+|---|---|---|
+| `required_columns` | `CUST_ID`, `BALANCE`, `PURCHASES`, `CREDIT_LIMIT` present | present |
+| `row_count` | at least `min_rows` rows (default 1,000) | 8,950 |
+| `missing_values` | at most `max_missing_fraction` of rows have a blank (default 5%) | 3.5% |
+| `non_negative` | no negative balance, purchases or credit limit | none |
+| `unique_ids` | no repeated `CUST_ID` | none |
+
+`dags/data/bad_sample.csv` is 1,200 rows of the real data, deliberately broken. It fails three checks: 19% of rows have a blank, 5 purchases are negative, and 3 IDs are duplicated.
+
+**Assets.** `publish_dataset` writes an immutable copy to `working_data/datasets/customers/<run id>.parquet` and records an asset event carrying its path, row count, content hash and source file. `customer_clustering` is scheduled on that Asset (`schedule=[customers]`). Its `resolve_dataset` task reads the triggering event, so a run always clusters the version that started it, even if a newer one is published meanwhile. A manual run uses the newest version. Rejected data emits no event, so it can never reach training.
+
+**Dynamic task mapping.** `fit_kmeans.partial(scaled_path=…).expand(k=k_values)` creates one task instance per k at run time, from the `k_min`…`k_max` Params. They run 8 at a time (`max_active_tis_per_dagrun`), each limited to one CPU thread so they don't compete for cores. `choose_k` receives all the SSE values in order and finds the elbow with `kneed`.
+
+**The model.** `train_final_model` fits KMeans with the chosen k and saves it **behind its fitted scaler** as one scikit-learn pipeline (`MinMaxScaler → KMeans`), so it takes raw feature values. `predict` writes every customer's cluster to `clusters.csv`, predicts the row in `test.csv`, and warns when an input is outside the range seen in training.
+
+**Params** are validated when a run is triggered, so a wrong value is rejected with an error before anything runs:
+
+| DAG | Param | Default | Rule |
+|---|---|---|---|
+| customer_data_ingest | `input_file` | `file.csv` | a `.csv` name in `dags/data/` (no paths) |
+| | `min_rows` | 1000 | ≥ 1 |
+| | `max_missing_fraction` | 0.05 | 0 to 1 |
+| customer_clustering | `k_min` | 1 | ≥ 1 |
+| | `k_max` | 49 | 2 to 100, and at least 4 above `k_min` |
+
+**Failure handling** (`dags/src/runs.py`):
+- Every task retries twice, 10 s apart, and has a 10-minute timeout (2 minutes per `fit_kmeans`).
+- Failed quality checks and invalid k ranges raise `AirflowFailException`, which is never retried.
+- `record_failure`, the `on_failure_callback`, writes the task, try number and error to `working_data/<run id>/failures/<task>.json`.
+
+**XCom carries only small values:** file paths, the SSE list and the results. The data stays in files. Each run gets its own folder:
+
+```text
+working_data/
+├── datasets/customers/<ingest run id>.parquet   published versions (never overwritten)
+└── <run id>/
+    ├── raw.parquet, quality_report.json        ingest
+    ├── scaled.npy, scaler.pkl, sse.json         clustering: inputs and the SSE curve with its elbow
+    ├── model.pkl, clusters.csv                  the trained pipeline and every customer's cluster
+    └── failures/<task>.json                     only if a task failed
 ```
-- Lastly, the script allows for command-line interaction with the DAG. When the script is run directly, the dag.cli() function is called, providing the ability to trigger and manage the DAG from the command line.
-- This script defines a comprehensive Airflow DAG for a data processing and modeling workflow, with clear task dependencies and default arguments.
 
-### Running an Apache Airflow DAG Pipeline in Docker
+## What a successful run looks like
 
-This guide provides detailed steps to set up and run an Apache Airflow Directed Acyclic Graph (DAG) pipeline within a Docker container using Docker Compose. The pipeline is named "your_python_dag."
+The end of `./run_lab.sh`:
 
-#### Prerequisites
+```text
+==> Unit and DAG tests (pytest, inside the Airflow image)
+..................                                                       [100%]
+18 passed in 9.66s
 
-- Docker: Make sure Docker is installed and running on your system.
+==> End-to-end run through the scheduler
+1. Unpausing both DAGs (the consumer first, so it is listening when data is published)
+2. The daily ingest run starts by itself and publishes validated data
+  ok   ingest run scheduled__2026-11-12T00:00:00+00:00 (scheduled) succeeded
+  ok   the quality gate skipped reject_data
+       published 8950 rows, sha256 8c1b84552e71: /opt/airflow/working_data/datasets/customers/scheduled__....parquet
+       quality checks: row_count passed, unique_ids passed, non_negative passed, missing_values passed, required_columns passed
+3. The publish starts customer_clustering on that exact version
+  ok   clustering run asset_triggered__... was started by the asset event
+  ok   clustering run succeeded
+  ok   it clustered the version that ingest published
+  ok   49 mapped fit_kmeans tasks succeeded
+  ok   the final model uses the elbow's k (8)
+       test.csv row -> cluster 6, outside the training range: ['CREDIT_LIMIT']
+       cluster sizes: {'0': 1204, '1': 1251, '2': 255, '3': 770, '4': 1737, '5': 3151, '6': 23, '7': 245}
+4. Bad data is rejected and starts nothing
+  ok   the bad_sample.csv ingest was rejected
+  ok   nothing was published
+       failed checks: ['unique_ids', 'non_negative', 'missing_values']
+       watching 45s for a clustering run ...
+  ok   no clustering run was started
 
-#### Step 1: Directory Structure
+End-to-end check passed.
+```
 
-Ensure your project has the following directory structure:
+Run IDs and dates will differ. The checks, k, the cluster sizes and the data hash should match, because KMeans is seeded (`random_state=42`). If any check fails, the script prints `FAIL` next to it and exits with an error.
 
-```plaintext
-your_airflow_project/
+## Results and findings
+
+- **The elbow is at k = 8** for k = 1…49. That gives 8 segments, from 3,151 customers down to a 23-customer group with very high credit limits.
+- **The original lab trained the right curve but saved the wrong model.** It fitted k = 1…49 to draw the elbow, then saved the k = 49 model (the last one fitted). This version trains the elbow's k.
+- **The original predicted on unscaled data.** The model was trained on min-max scaled features, but `test.csv` was passed in raw. For ordinary customers, predicting on raw values agrees with the correct cluster only **1.9%** of the time; it puts everyone in two clusters. Saving the scaler inside the model fixes this.
+- **The lab's only test input is out of range.** `test.csv` has a credit limit of 241,514, 8× the largest in the data (30,000), so its cluster says little. `predict` now flags this (`test_out_of_range: ['CREDIT_LIMIT']`).
+- **The elbow depends on the range you search.** k = 1…30 gives an elbow at **5**, and 1…49 gives 8. It's a heuristic, not a property of the data. That's why the range is a Param and is saved with the curve in `sse.json`.
+- **XCom used to hold the data.** The original pushed the DataFrame through XCom as base64-encoded pickles, 1.79 MB and 0.28 MB per run, stored in the metadata database. Now XCom holds file paths and small results.
+- **Speed.** A clustering run takes about 23 s on its own (the 49 fits run in parallel). The original's serial loop of 49 fits took 34–40 s.
+
+## What changed from the original lab
+
+| Area | Original lab | This version | Airflow concept |
+|---|---|---|---|
+| Running it | No `docker-compose.yaml`; the tutorial links the Airflow **2.5.1** compose file while the DAG uses Airflow 3 imports. Packages were to be installed at container start, and a 110 KB `airflow.cfg` dump was deleted by its own `setup.sh` | A pinned Airflow **3.3.2** `docker-compose.yaml` trimmed for a laptop (LocalExecutor + Postgres, no Redis or Celery), with packages baked into an image. `setup.sh` resets, builds, migrates and waits for health | Running Airflow on Docker |
+| DAG style | `PythonOperator` with `op_args` and `.output` wiring | TaskFlow (`@dag`/`@task` from `airflow.sdk`), where calling the tasks defines the dependencies and the XCom hand-offs. The DAG file is renamed from `airflow.py`, which could shadow the `airflow` package | TaskFlow API |
+| Passing data | Base64-encoded pickled DataFrames through XCom (about 2 MB per run in the database) | Files in a per-run folder; XCom carries paths and small results | What XCom is for |
+| Model search | One task fitting k = 1…49 in a loop | 49 **mapped** task instances in parallel (`expand`), reduced by `choose_k` | Dynamic task mapping, fan-out/fan-in |
+| Model | Saved the k = 49 model and predicted on unscaled data | Trains the elbow's k and saves it behind its scaler; flags out-of-range inputs | |
+| Data quality | None | Five checks and a branch that publishes or rejects | Branching (`@task.branch`) |
+| Configuration | Hard-coded file and k range | Params, validated at trigger time | Params |
+| Failures | `retries: 0` | Retries, per-task timeouts, non-retryable `AirflowFailException` for failed checks, and an `on_failure_callback` | Retries, timeouts, callbacks |
+| Scheduling | One manually triggered DAG | A daily ingest DAG and a clustering DAG scheduled on the `customers` **Asset**, which publishes `customer_segments` | Assets (data-aware scheduling) |
+| Tests | None | 18 pytest tests (DAG structure, Params, the pipeline functions) and an end-to-end check against the scheduler | DAG testing |
+| Automation | Manual UI steps | `run_lab.sh`: fresh start, tests, end-to-end check | |
+
+## Project layout
+
+```text
+MLOps-Lab4/
+├── run_lab.sh                 whole lab end to end
+├── setup.sh                   build and start Airflow from a clean state
+├── docker-compose.yaml        Airflow 3.3.2 + Postgres (LocalExecutor)
+├── Dockerfile                 apache/airflow:3.3.2-python3.12 + requirements.txt
+├── requirements.txt           kneed, pytest
 ├── dags/
-│   ├── airflow.py     # Your DAG script
-├── src/
-│   ├── lab.py                # Data processing and modeling functions
-├── data/                       # Directory for data (if needed)
-├── docker-compose.yaml         # Docker Compose configuration
+│   ├── ingest_pipeline.py     customer_data_ingest: load, check, publish the customers Asset
+│   ├── kmeans_pipeline.py     customer_clustering: mapped KMeans fits, elbow, final model, predictions
+│   ├── src/
+│   │   ├── lab.py             the pipeline steps as plain functions (no Airflow imports)
+│   │   └── runs.py            Assets, per-run folders, retry defaults, failure callback
+│   └── data/
+│       ├── file.csv           8,950 customers, 18 columns (the lab's data)
+│       ├── test.csv           the lab's single prediction input
+│       └── bad_sample.csv     deliberately broken sample for the quality gate
+├── tests/
+│   ├── test_dags.py           the DAGs import and are wired as intended
+│   ├── test_lab.py            the pipeline functions
+│   └── end_to_end.py          run by run_lab.sh against the live scheduler
+├── ORIGINAL_LAB.md            the original write-up (unchanged)
+└── working_data/, logs/       created at run time (git-ignored)
 ```
 
-#### Step 2: Docker Compose Configuration
-Create a docker-compose.yaml file in the project root directory. This file defines the services and configurations for running Airflow in a Docker container.
+## Troubleshooting
 
-#### Step 3: Start the Docker containers by running the following command
-
-```plaintext
-docker compose up
-```
-
-Wait until you see the log message indicating that the Airflow webserver is running:
-
-```plaintext
-app-airflow-webserver-1 | 127.0.0.1 - - [17/Feb/2023:09:34:29 +0000] "GET /health HTTP/1.1" 200 141 "-" "curl/7.74.0"
-```
-
-#### Step 4: Access Airflow Web Interface
-- Open a web browser and navigate to http://localhost:8080.
-
-- Log in with the credentials set in the .env file or use the default credentials (username: admin, password: admin).
-
-- Once logged in, you'll be on the Airflow web interface.
-
-#### Step 5: Trigger the DAG
-- In the Airflow web interface, navigate to the "DAGs" page.
-
-- You should see the "your_python_dag" listed.
-
-- To manually trigger the DAG, click on the "Trigger DAG" button or enable the DAG by toggling the switch to the "On" position.
-
-- Monitor the progress of the DAG in the Airflow web interface. You can view logs, task status, and task execution details.
-
-#### Step 6: Pipeline Outputs
-
-- Once the DAG completes its execution, check any output or artifacts produced by your functions and tasks. 
+| Problem | Fix |
+|---|---|
+| `Docker is installed but not running` | Start Docker Desktop and wait for it to say it's running |
+| `port is already allocated` / `address already in use` on 8080 | Something else uses 8080 (a common default, e.g. an MLflow or Jupyter server). Run `AIRFLOW_PORT=8081 ./setup.sh` |
+| A run stays **queued** and never starts | Its DAG is paused, and new DAGs start paused. Unpause it with the toggle or `airflow dags unpause <dag_id>` |
+| No clustering run after an ingest | Check the ingest run's `publish_dataset` succeeded (a rejected file publishes nothing), and that customer_clustering is unpaused |
+| Containers restart or tasks are killed (exit code 137) | Docker is out of memory. Give its VM at least 4 GB, or lower `MAX_PARALLEL_FITS` in `dags/kmeans_pipeline.py` |
+| `Permission denied` writing `working_data/` or `logs/` (Linux) | Run `./setup.sh`, which writes your user ID to `.env`, and don't run it with `sudo` |
+| `./setup.sh: Permission denied` | `chmod +x setup.sh run_lab.sh`, or run `bash setup.sh` |
+| `$'\r': command not found` (Windows) | The scripts were checked out with Windows line endings. Clone inside WSL, or run `git config core.autocrlf input` and clone again (`.gitattributes` keeps `*.sh` as LF) |
+| A DAG shows an import error | Open it in the UI or run `docker compose logs airflow-dag-processor`. The tests catch this too: `docker compose run --rm --no-deps airflow-cli bash -c "cd /opt/airflow && python -m pytest tests"` |
