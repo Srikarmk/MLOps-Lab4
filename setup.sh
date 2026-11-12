@@ -20,7 +20,7 @@ fi
 # Remove containers and the metadata database from a previous run
 docker compose down -v --remove-orphans
 
-mkdir -p ./logs ./plugins
+mkdir -p ./logs ./plugins ./working_data
 # Containers run as this UID so files they write to the mounted folders belong to you
 echo "AIRFLOW_UID=$(id -u)" > .env
 [ -n "${AIRFLOW_PORT:-}" ] && echo "AIRFLOW_PORT=$AIRFLOW_PORT" >> .env
