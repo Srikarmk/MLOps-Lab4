@@ -23,9 +23,14 @@ def run_dir() -> Path:
     return path
 
 
+# Mapped KMeans fits allowed at once. Each is its own process (~0.2 GB), so this keeps the run inside
+# a 4 GB Docker VM; raise it on a bigger machine.
+MAX_PARALLEL_FITS = 8
+
+
 @dag(
     dag_id="Airflow_Lab1",
-    description="KMeans clustering with the elbow method",
+    description="KMeans clustering: one mapped task per k, then the elbow's k is trained and used",
     start_date=pendulum.datetime(2026, 1, 15, tz="UTC"),
     schedule=None,  # triggered manually
     catchup=False,
@@ -38,19 +43,34 @@ def kmeans_pipeline():
         return lab.load_data(run_dir())
 
     @task
-    def data_preprocessing(raw_path: str) -> str:
+    def data_preprocessing(raw_path: str) -> dict:
         return lab.data_preprocessing(raw_path, run_dir())
 
-    @task
-    def build_save_model(scaled_path: str) -> dict:
-        return lab.build_save_model(scaled_path, run_dir())
+    @task(max_active_tis_per_dagrun=MAX_PARALLEL_FITS)
+    def fit_kmeans(k: int, scaled_path: str) -> float:
+        return lab.fit_kmeans(scaled_path, k)
 
     @task
-    def load_model_elbow(model: dict) -> dict:
-        return lab.load_model_elbow(model["model_path"], model["sse"])
+    def choose_k(sse: list[float]) -> int:
+        # The mapped results arrive in map-index order, which is the order of lab.K_VALUES
+        return lab.choose_k(lab.K_VALUES, list(sse), run_dir())
 
-    # Calling the tasks wires both the dependencies and the XCom hand-offs
-    load_model_elbow(build_save_model(data_preprocessing(load_data())))
+    @task
+    def train_final_model(prep: dict, k: int) -> str:
+        return lab.train_final_model(prep["scaled_path"], prep["scaler_path"], k, run_dir())
+
+    @task
+    def predict(model_path: str, raw_path: str) -> dict:
+        return lab.predict(model_path, raw_path, run_dir())
+
+    raw = load_data()
+    prep = data_preprocessing(raw)
+    # Fan out: one fit_kmeans task instance per k, created at run time from the list
+    sse = fit_kmeans.partial(scaled_path=prep["scaled_path"]).expand(k=lab.K_VALUES)
+    # Fan in: choose_k receives all 49 results at once
+    k = choose_k(sse)
+    model = train_final_model(prep, k)
+    predict(model, raw)
 
 
 pipeline = kmeans_pipeline()
