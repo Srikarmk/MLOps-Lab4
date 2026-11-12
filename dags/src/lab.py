@@ -4,8 +4,10 @@ Each step writes its data to the run's folder and returns only something small (
 a few counts) for the DAG to hand to the next task through XCom.
 """
 
+import hashlib
 import json
 import pickle
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +54,22 @@ def validate_data(raw_path, run_dir, min_rows, max_missing_fraction) -> dict:
     with open(Path(run_dir) / "quality_report.json", "w") as f:
         json.dump(report, f, indent=2)
     return report
+
+
+def publish_dataset(raw_path, datasets_dir, version) -> dict:
+    """Copy validated data to datasets/customers/<version>.parquet, a file that is never overwritten.
+
+    Returns what the asset event records: where the version is, how many rows it has and its content hash.
+    """
+    out_dir = Path(datasets_dir) / "customers"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{version}.parquet"
+    shutil.copyfile(raw_path, out_path)
+    return {
+        "path": str(out_path),
+        "rows": len(pd.read_parquet(out_path)),
+        "sha256": hashlib.sha256(out_path.read_bytes()).hexdigest()[:12],
+    }
 
 
 def data_preprocessing(raw_path, run_dir) -> dict:

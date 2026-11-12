@@ -4,7 +4,7 @@
 > ./setup.sh                 # build the image, migrate the database, start Airflow
 > ```
 >
-> Open http://localhost:8080 (no login), unpause **Airflow_Lab1** and trigger it. Each run writes its data and model to `working_data/<run id>/`. To see the data-quality gate reject a file, choose "Trigger with config" and set `input_file` to `bad_sample.csv`; the other Params (k range, gate thresholds) are on the same form. Stop with `docker compose down` (`-v` also deletes the metadata database). If port 8080 is taken: `AIRFLOW_PORT=8081 ./setup.sh`.
+> Open http://localhost:8080 (no login) and unpause both DAGs. **customer_data_ingest** (daily) loads and checks `dags/data/file.csv` and, only if the data passes its quality gate, publishes it as the `customers` Asset. **customer_clustering** has no clock schedule: each published version starts it automatically. Every run writes its files to `working_data/<run id>/`, and published data goes to `working_data/datasets/customers/`. To see the gate reject a file, trigger customer_data_ingest with config `input_file` = `bad_sample.csv`; no clustering run follows. Stop with `docker compose down` (`-v` also deletes the metadata database). If port 8080 is taken: `AIRFLOW_PORT=8081 ./setup.sh`.
 
 # Airflow lab
 
