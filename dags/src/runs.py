@@ -10,9 +10,9 @@ from airflow.sdk import Asset, get_current_context
 WORKING_DIR = Path("/opt/airflow/working_data")
 DATASETS_DIR = WORKING_DIR / "datasets"
 
-# customer_data_ingest updates CUSTOMERS only when the data passes the quality gate; customer_clustering
+# retail_ingest updates TRANSACTIONS only when the data passes the quality gate; customer_segmentation
 # is scheduled on it, so it runs once per validated version and never on rejected data
-CUSTOMERS = Asset(name="customers", uri="file:///opt/airflow/working_data/datasets/customers")
+TRANSACTIONS = Asset(name="retail_transactions", uri="file:///opt/airflow/working_data/datasets/transactions")
 SEGMENTS = Asset(name="customer_segments", uri="file:///opt/airflow/working_data/datasets/segments")
 
 

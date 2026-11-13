@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the whole lab end to end on a fresh Airflow:
-#   start Airflow -> unit and DAG tests -> daily ingest publishes the customers Asset
-#   -> that starts customer_clustering -> a bad file is rejected and starts nothing
+#   start Airflow -> unit and DAG tests -> daily ingest publishes the retail_transactions Asset
+#   -> that starts customer_segmentation -> a bad file is rejected and starts nothing
 #
 #   ./run_lab.sh                 leave Airflow running afterwards, to look at the runs in the UI
 #   ./run_lab.sh --down          stop Airflow and delete its database at the end

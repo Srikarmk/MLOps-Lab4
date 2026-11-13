@@ -1,9 +1,10 @@
 """End-to-end check against the running Airflow, used by run_lab.sh (not collected by pytest).
 
 1. Unpause both DAGs. The daily ingest DAG then starts its latest scheduled run by itself.
-2. That run must pass the quality gate and publish a version of the customers Asset.
-3. The publish must start customer_clustering (an asset-triggered run) on exactly that version.
-4. An ingest of bad_sample.csv must be rejected, and must not start any clustering run.
+2. That run must pass the quality gate and publish a version of the retail_transactions Asset.
+3. The publish must start customer_segmentation (an asset-triggered run) on exactly that version, which
+   fits one Gaussian mixture per (k, covariance type) and uses the one with the lowest BIC.
+4. An ingest of bad_sample.csv.gz must be rejected, and must not start any segmentation run.
 
 Run inside the image: docker compose run --rm airflow-cli python /opt/airflow/tests/end_to_end.py
 """
@@ -17,8 +18,9 @@ import urllib.parse
 import urllib.request
 
 API = os.environ.get("AIRFLOW_API", "http://airflow-apiserver:8080/api/v2")
-INGEST, CLUSTERING = "customer_data_ingest", "customer_clustering"
-NO_TRIGGER_WAIT = 45  # seconds to watch for a clustering run that must not appear
+INGEST, SEGMENTATION = "retail_ingest", "customer_segmentation"
+FITS = 12 * 4  # k = 1..12 (the default) x 4 covariance types
+NO_TRIGGER_WAIT = 45  # seconds to watch for a segmentation run that must not appear
 problems = []
 
 
@@ -87,14 +89,14 @@ def main():
             time.sleep(2)
     # Right after a fresh start the DAG processor may not have registered the DAGs yet
     deadline = time.time() + 180
-    while {INGEST, CLUSTERING} - {d["dag_id"] for d in call("GET", "/dags")["dags"]}:
+    while {INGEST, SEGMENTATION} - {d["dag_id"] for d in call("GET", "/dags")["dags"]}:
         if time.time() > deadline:
             sys.exit("The DAGs were not registered within 180s; check `docker compose logs airflow-dag-processor`")
         time.sleep(2)
 
     print("1. Unpausing both DAGs (the consumer first, so it is listening when data is published)")
-    known_clustering = run_ids(CLUSTERING)
-    for dag_id in (CLUSTERING, INGEST):
+    known_segmentation = run_ids(SEGMENTATION)
+    for dag_id in (SEGMENTATION, INGEST):
         call("PATCH", f"/dags/{dag_id}", {"is_paused": False})
 
     print("2. The daily ingest run starts by itself and publishes validated data")
@@ -111,38 +113,46 @@ def main():
     print("       quality checks: " + ", ".join(f"{name} {'passed' if c['passed'] else 'FAILED'}"
                                                   for name, c in report["checks"].items()))
 
-    print("3. The publish starts customer_clustering on that exact version")
-    clustering = wait_for_new_run(CLUSTERING, known_clustering, timeout=120)
-    if clustering is None:
-        sys.exit("No clustering run appeared within 120s of the publish")
-    clustering = wait_until_done(CLUSTERING, clustering["dag_run_id"])
-    run_id = clustering["dag_run_id"]
-    expect(clustering["run_type"] == "asset_triggered", f"clustering run {run_id} was started by the asset event")
-    expect(clustering["state"] == "success", "clustering run succeeded")
-    dataset = xcom(CLUSTERING, run_id, "resolve_dataset")
+    print("3. The publish starts customer_segmentation on that exact version")
+    run = wait_for_new_run(SEGMENTATION, known_segmentation, timeout=120)
+    if run is None:
+        sys.exit("No segmentation run appeared within 120s of the publish")
+    run = wait_until_done(SEGMENTATION, run["dag_run_id"])
+    run_id = run["dag_run_id"]
+    expect(run["run_type"] == "asset_triggered", f"segmentation run {run_id} was started by the asset event")
+    expect(run["state"] == "success", "segmentation run succeeded")
+    dataset = xcom(SEGMENTATION, run_id, "resolve_dataset")
     expect(dataset["path"] == published["path"] and dataset["sha256"] == published["sha256"],
-           "it clustered the version that ingest published")
-    fits = len([t for t in call("GET", f"/dags/{CLUSTERING}/dagRuns/{quote(run_id)}/taskInstances?limit=200")
-                ["task_instances"] if t["task_id"] == "fit_kmeans" and t["state"] == "success"])
-    k = xcom(CLUSTERING, run_id, "choose_k")
-    result = xcom(CLUSTERING, run_id, "predict")
-    expect(fits == 49, f"{fits} mapped fit_kmeans tasks succeeded")
-    expect(result["k"] == k, f"the final model uses the elbow's k ({k})")
-    print(f"       test.csv row -> cluster {result['test_cluster']}, outside the training range: {result['test_out_of_range']}")
-    print(f"       cluster sizes: {result['cluster_sizes']}")
+           "it used the version that ingest published")
+    features = xcom(SEGMENTATION, run_id, "build_features")
+    print(f"       {features['purchase_lines']} purchase lines -> {features['customers']} customers; "
+          f"{features['cancellation_lines']} cancellations netted out; dropped {features['dropped_lines']}")
+    fits = len([t for t in call("GET", f"/dags/{SEGMENTATION}/dagRuns/{quote(run_id)}/taskInstances?limit=200")
+                ["task_instances"] if t["task_id"] == "fit_gmm" and t["state"] == "success"])
+    choice = xcom(SEGMENTATION, run_id, "choose_model")
+    result = xcom(SEGMENTATION, run_id, "predict")
+    expect(fits == FITS, f"{fits} mapped fit_gmm tasks succeeded")
+    expect((result["k"], result["covariance_type"]) == (choice["k"], choice["covariance_type"]),
+           f"the final model is the chosen fit: k={choice['k']}, {choice['covariance_type']} covariance "
+           f"(the lowest BIC is at k={choice['lowest_bic_k']}, {choice['above_lowest_bic']} lower)")
+    expect(sum(s["customers"] for s in result["segments"]) == features["customers"], "every customer got a segment")
+    print(f"       {result['uncertain_customers']} of {result['customers']} customers have no segment with probability >= 0.8")
+    for s in result["segments"]:
+        print(f"       segment {s['segment']}: {s['customers']:>5} customers, {s['revenue_share']:.1%} of revenue, "
+              f"median invoices {s['median_invoices']:g}, last bought {s['median_recency_days']:g} days ago")
 
     print("4. Bad data is rejected and starts nothing")
-    known_clustering = run_ids(CLUSTERING)
-    bad = call("POST", f"/dags/{INGEST}/dagRuns", {"logical_date": None, "conf": {"input_file": "bad_sample.csv"}})
+    known_segmentation = run_ids(SEGMENTATION)
+    bad = call("POST", f"/dags/{INGEST}/dagRuns", {"logical_date": None, "conf": {"input_file": "bad_sample.csv.gz"}})
     bad = wait_until_done(INGEST, bad["dag_run_id"])
     states = task_states(INGEST, bad["dag_run_id"])
-    expect(bad["state"] == "failed" and states.get("reject_data") == {"failed"}, "the bad_sample.csv ingest was rejected")
+    expect(bad["state"] == "failed" and states.get("reject_data") == {"failed"}, "the bad_sample.csv.gz ingest was rejected")
     expect(states.get("publish_dataset") == {"skipped"}, "nothing was published")
     failed_checks = [name for name, c in xcom(INGEST, bad["dag_run_id"], "validate_data")["checks"].items() if not c["passed"]]
     print(f"       failed checks: {failed_checks}")
-    print(f"       watching {NO_TRIGGER_WAIT}s for a clustering run ...")
-    expect(wait_for_new_run(CLUSTERING, known_clustering, timeout=NO_TRIGGER_WAIT) is None,
-           "no clustering run was started")
+    print(f"       watching {NO_TRIGGER_WAIT}s for a segmentation run ...")
+    expect(wait_for_new_run(SEGMENTATION, known_segmentation, timeout=NO_TRIGGER_WAIT) is None,
+           "no segmentation run was started")
 
     if problems:
         sys.exit(f"\n{len(problems)} check(s) failed: {problems}")
